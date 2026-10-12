@@ -109,16 +109,27 @@ pub struct Ocr {
 }
 
 impl Ocr {
-    pub fn load(models: &Models) -> Result<Ocr, OcrError> {
-        let load = |p: &Path| rten::Model::load_file(p).map_err(|e| OcrError::Load(p.display().to_string(), e.to_string()));
+    fn from_models(detection_model: rten::Model, recognition_model: rten::Model) -> Result<Ocr, OcrError> {
         let params = ocrs::OcrEngineParams {
-            detection_model: Some(load(&models.detection)?),
-            recognition_model: Some(load(&models.recognition)?),
+            detection_model: Some(detection_model),
+            recognition_model: Some(recognition_model),
             alphabet: Some(ALPHABET.into()),
             ..Default::default()
         };
         let engine = ocrs::OcrEngine::new(params).map_err(|e| OcrError::Load("ocr engine".into(), e.to_string()))?;
         Ok(Ocr { engine })
+    }
+
+    pub fn load(models: &Models) -> Result<Ocr, OcrError> {
+        let load = |p: &Path| rten::Model::load_file(p).map_err(|e| OcrError::Load(p.display().to_string(), e.to_string()));
+        Self::from_models(load(&models.detection)?, load(&models.recognition)?)
+    }
+
+    /// Load the two RTen models from bytes. Browser hosts use this after fetching the same
+    /// verified model files that desktop packages install on disk.
+    pub fn load_bytes(detection: Vec<u8>, recognition: Vec<u8>) -> Result<Ocr, OcrError> {
+        let load = |name: &str, bytes: Vec<u8>| rten::Model::load(bytes).map_err(|e| OcrError::Load(name.into(), e.to_string()));
+        Self::from_models(load(DETECTION_MODEL, detection)?, load(RECOGNITION_MODEL, recognition)?)
     }
 
     /// Load the models found by [`Models::find`].
@@ -342,6 +353,21 @@ mod tests {
     fn missing_models_message_is_for_end_users() {
         let message = OcrError::NoModels.to_string();
         assert!(!message.contains("cargo") && message.contains("PDFCRAFT_MODELS"), "{message}");
+    }
+
+    /// A non-filesystem host (the web build) can create the same recogniser from downloaded bytes.
+    #[test]
+    fn loads_models_from_bytes() {
+        let Some(models) = Models::find() else {
+            eprintln!("skipped: OCR models not installed");
+            return;
+        };
+        let detection = std::fs::read(&models.detection).unwrap();
+        let recognition = std::fs::read(&models.recognition).unwrap();
+        let ocr = Ocr::load_bytes(detection, recognition).unwrap();
+        let (w, h, px) = test_image::hello();
+        let lines = ocr.recognize(&px, w, h).unwrap();
+        assert!(lines.iter().map(Line::text).any(|t| t.contains("HELL") && t.contains("WOR")));
     }
 
     /// End to end on rendered text, when the models are installed (`cargo xtask models`).

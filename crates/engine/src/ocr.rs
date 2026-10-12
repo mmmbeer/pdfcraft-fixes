@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use pdfcraft_render::{PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
 
-pub use pdfcraft_ocr::{LANGUAGES, Models, Ocr, OcrError, PlacedWord};
+pub use pdfcraft_ocr::{DETECTION_MODEL, LANGUAGES, Models, Ocr, OcrError, PlacedWord, RECOGNITION_MODEL};
 
 use crate::{DocId, Edit, EditError, Session};
 
@@ -68,21 +68,40 @@ impl OcrPage {
     }
 }
 
+fn engine_slot() -> &'static Mutex<Option<Arc<Ocr>>> {
+    static OCR: Mutex<Option<Arc<Ocr>>> = Mutex::new(None);
+    &OCR
+}
+
+fn loaded_engine() -> Option<Arc<Ocr>> {
+    engine_slot().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The recogniser, loaded once (it takes a moment) and shared.
 pub fn engine() -> Result<Arc<Ocr>, String> {
-    static OCR: Mutex<Option<Arc<Ocr>>> = Mutex::new(None);
-    let mut slot = OCR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(o) = loaded_engine() {
+        return Ok(o);
+    }
+    let loaded = Arc::new(Ocr::find().map_err(|e| e.to_string())?);
+    let mut slot = engine_slot().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(o) = slot.as_ref() {
         return Ok(o.clone());
     }
-    let o = Arc::new(Ocr::find().map_err(|e| e.to_string())?);
-    *slot = Some(o.clone());
-    Ok(o)
+    *slot = Some(loaded.clone());
+    Ok(loaded)
 }
 
-/// Whether the recognition models are installed.
+/// Install a recogniser supplied by a host that cannot load models from native file paths.
+/// The web build uses this after it fetches the release's RTen model files.
+pub fn install_engine(ocr: Ocr) -> Arc<Ocr> {
+    let ocr = Arc::new(ocr);
+    *engine_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(ocr.clone());
+    ocr
+}
+
+/// Whether recognition can start without first obtaining model bytes from the host.
 pub fn available() -> bool {
-    Models::find().is_some()
+    loaded_engine().is_some() || Models::find().is_some()
 }
 
 /// Everything recognition needs from a document, detached from the session.

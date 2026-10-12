@@ -8,6 +8,7 @@ static site in `pdfcraft-web-<version>/`:
 | `index.html` | The page. It loads everything through relative URLs. |
 | `pdfcraft-web-<hash>.js` | wasm-bindgen glue (generated, ES module) |
 | `pdfcraft-web-<hash>_bg.wasm` | The app, about 13 MB, or 5 MB with compression |
+| `models/` | The verified RTen OCR models, licence texts and attribution. They are fetched by the browser only when OCR is first used. |
 | `_headers`, `.htaccess` | Sample header rules for Netlify/Cloudflare Pages and Apache |
 
 There is no server-side code. Upload the folder's contents anywhere that serves static files.
@@ -16,8 +17,9 @@ There is no server-side code. Upload the folder's contents anywhere that serves 
 
 All URLs in `index.html` are relative (`public_url = "./"` in `apps/pdfcraft-web/Trunk.toml`),
 so the site works at a domain root (`https://example.com/`), under a prefix
-(`https://example.com/tools/pdfcraft/`) and from a CDN bucket. The asset names carry a content
-hash, so they can be cached forever. Only `index.html` needs revalidation.
+(`https://example.com/tools/pdfcraft/`) and from a CDN bucket. Generated JavaScript and WASM
+names carry a content hash and can be cached forever. OCR model filenames stay stable, but the
+app requests them with its version in the query string. Only `index.html` needs revalidation.
 
 Add `?file=<URL-encoded document URL>` to open a PDF on startup. The document must be served
 from the same origin or allow the app's origin through CORS. If the user starts working before
@@ -33,7 +35,8 @@ workspace and Save target stay selected. Click the downloaded file's tab to swit
   download from about 13 MB to about 5 MB. You can also precompress (`brotli -k *.wasm`) and let
   the server send `Content-Encoding: br`.
 - **Caching:** `Cache-Control: public, max-age=31536000, immutable` on the hashed `.wasm` and
-  `.js` files, and `no-cache` on `index.html`.
+  `.js` files, and `no-cache` on `index.html`. OCR model requests carry the PdfCraft version
+  as a query parameter, so a browser does not reuse an older release's model bytes.
 - **HTTPS:** WebGPU (and the clipboard) only work in a secure context, which means `https://`
   or `http://localhost`. Over plain HTTP elsewhere, the app falls back to WebGL2.
 - **No special isolation headers:** PdfCraft doesn't use `SharedArrayBuffer`, so it doesn't

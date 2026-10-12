@@ -3,8 +3,9 @@
 #
 # Usage: packaging/web/package.sh [--skip-build]
 #
-# Needs: trunk (brew install trunk / cargo install trunk --locked) and the wasm32-unknown-unknown
-# target. The zip holds a self-contained static site in pdfcraft-web-<version>/ that works
+# Needs: trunk (brew install trunk / cargo install trunk --locked), curl/network for the verified
+# OCR model fetch, and the wasm32-unknown-unknown target. The zip holds a self-contained static
+# site in pdfcraft-web-<version>/ that works
 # from any URL path and inside an <iframe>. Hosting notes: packaging/web/README.md.
 set -euo pipefail
 # shellcheck source=../env.sh
@@ -18,6 +19,7 @@ fi
 
 SITE="$ROOT/dist/web"
 [ -f "$SITE/index.html" ] || { echo "error: $SITE/index.html missing; run without --skip-build" >&2; exit 1; }
+[ -f "$SITE/models/ATTRIBUTION.txt" ] || { echo "error: $SITE/models is missing the OCR models; run without --skip-build" >&2; exit 1; }
 # Paths must be relative so the site works under any prefix (public_url = "./" in Trunk.toml).
 if grep -Eq '(src|href)="/[^/]' "$SITE/index.html"; then
   echo "error: $SITE/index.html has root-absolute URLs; it would break when served from a sub-path" >&2
