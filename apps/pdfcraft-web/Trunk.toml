@@ -9,3 +9,10 @@ filehash = true
 [serve]
 addresses = ["127.0.0.1"]
 port = 8766
+
+# Keep the OCR models outside the main WASM file. The xtask verifies their pinned SHA-256 values,
+# writes their licence texts/attribution, and is a no-op download when the verified files are cached.
+[[hooks]]
+stage = "post_build"
+command = "cargo"
+command_arguments = ["xtask", "models", "../../dist/web/models"]

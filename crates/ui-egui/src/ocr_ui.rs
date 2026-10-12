@@ -67,9 +67,101 @@ pub struct OcrRun {
     pub progress: Arc<Mutex<OcrProgress>>,
 }
 
+#[cfg(target_arch = "wasm32")]
+const MAX_WEB_MODEL_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_web_model(name: &str) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+
+    let window = web_sys::window().ok_or("the browser window is unavailable")?;
+    // The version query keeps a host or service worker from serving a model from an older release.
+    let url = format!("models/{name}?v={}", env!("CARGO_PKG_VERSION"));
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&url))
+        .await
+        .map_err(|e| format!("fetching {name}: {e:?}"))?;
+    let response: web_sys::Response = response.dyn_into().map_err(|_| format!("fetching {name}: the browser returned an invalid response"))?;
+    if !response.ok() {
+        return Err(format!("fetching {name}: HTTP {}", response.status()));
+    }
+    let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer().map_err(|e| format!("fetching {name}: {e:?}"))?)
+        .await
+        .map_err(|e| format!("fetching {name}: {e:?}"))?;
+    let bytes = js_sys::Uint8Array::new(&buffer);
+    if bytes.length() as usize > MAX_WEB_MODEL_BYTES {
+        return Err(format!("fetching {name}: model is larger than the {} MiB safety limit", MAX_WEB_MODEL_BYTES / (1024 * 1024)));
+    }
+    Ok(bytes.to_vec())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn web_engine() -> Result<Arc<pdfcraft_engine::ocr::Ocr>, String> {
+    if let Ok(ocr) = pdfcraft_engine::ocr::engine() {
+        return Ok(ocr);
+    }
+    let detection = fetch_web_model(pdfcraft_engine::ocr::DETECTION_MODEL).await?;
+    let recognition = fetch_web_model(pdfcraft_engine::ocr::RECOGNITION_MODEL).await?;
+    let ocr = pdfcraft_engine::ocr::Ocr::load_bytes(detection, recognition).map_err(|e| e.to_string())?;
+    Ok(pdfcraft_engine::ocr::install_engine(ocr))
+}
+
+fn finish_batch(
+    files: Vec<(String, Vec<u8>)>,
+    settings: OcrSettings,
+    progress: Arc<Mutex<BatchProgress>>,
+    lang: crate::i18n::Lang,
+    engine: Result<Arc<pdfcraft_engine::ocr::Ocr>, String>,
+    #[cfg(not(target_arch = "wasm32"))] dir: std::path::PathBuf,
+) {
+    crate::i18n::set_current(lang);
+    let (mut ok, mut words, mut failed) = (0, 0, Vec::new());
+    match engine {
+        Err(e) => failed.push(e),
+        Ok(ocr) => {
+            for (i, (name, bytes)) in files.into_iter().enumerate() {
+                if let Ok(mut s) = progress.lock() {
+                    s.done = i;
+                }
+                let result = pdfcraft_engine::ocr::recognize_file(&name, Arc::new(bytes), None, settings.clone(), &ocr, |_, _| true);
+                let saved = result.and_then(|result| {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    crate::editing::write_atomically(&dir.join(&name).to_string_lossy(), &result.bytes).map_err(|e| e.to_string())?;
+                    #[cfg(target_arch = "wasm32")]
+                    crate::editing::download(&name, &result.bytes)?;
+                    Ok(result.words())
+                });
+                match saved {
+                    Ok(n) => {
+                        ok += 1;
+                        words += n;
+                    }
+                    Err(e) => failed.push(format!("{name}: {e}")),
+                }
+            }
+        }
+    }
+    let done = if ok == 1 {
+        crate::i18n::fmt(tl!("Recognized {w} words in 1 file"), &[("w", &words.to_string())])
+    } else {
+        crate::i18n::fmt(tl!("Recognized {w} words in {n} files"), &[("w", &words.to_string()), ("n", &ok.to_string())])
+    };
+    let mut message = done;
+    if !failed.is_empty() {
+        message.push_str(&crate::i18n::fmt(tl!("; failed: {list}"), &[("list", &failed.join("; "))]));
+    }
+    if let Ok(mut s) = progress.lock() {
+        s.done = s.total;
+        s.message = Some(message);
+    }
+}
+
 pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> (bool, bool) {
     let pages = app.active_ids().and_then(|(_, id)| app.session.get(id)).map_or(1, |d| d.info.pages.len().max(1));
+    #[cfg(not(target_arch = "wasm32"))]
     let available = pdfcraft_engine::ocr::available();
+    // Web releases stage the verified model files beside the app and fetch them only if OCR is used.
+    #[cfg(target_arch = "wasm32")]
+    let available = true;
     let d = &mut app.ocr_draft;
     d.to = d.to.clamp(1, pages);
     d.from = d.from.clamp(1, d.to);
@@ -167,28 +259,49 @@ impl PdfCraftApp {
         let settings = d.settings();
         let Some(job) = self.session.ocr_job(id, &pages, settings) else { return };
         let progress = Arc::new(Mutex::new(OcrProgress { total: job.pages.len(), ..Default::default() }));
-        let p = progress.clone();
-        let work = move || {
-            let result = pdfcraft_engine::ocr::engine().map(|ocr| {
-                job.run(&ocr, |done, total| {
-                    let Ok(mut s) = p.lock() else { return false };
-                    s.done = done;
-                    s.total = total;
-                    !s.cancel
-                })
-            });
-            if let Ok(mut s) = p.lock() {
-                s.result = Some(result);
-            }
-        };
         #[cfg(not(target_arch = "wasm32"))]
-        if self.run_inline {
-            work();
-        } else {
-            std::thread::Builder::new().name("pdfcraft-ocr".into()).spawn(work).ok();
+        {
+            let p = progress.clone();
+            let work = move || {
+                let result = pdfcraft_engine::ocr::engine().map(|ocr| {
+                    job.run(&ocr, |done, total| {
+                        let Ok(mut s) = p.lock() else { return false };
+                        s.done = done;
+                        s.total = total;
+                        !s.cancel
+                    })
+                });
+                if let Ok(mut s) = p.lock() {
+                    s.result = Some(result);
+                }
+            };
+            if self.run_inline {
+                work();
+            } else {
+                std::thread::Builder::new().name("pdfcraft-ocr".into()).spawn(work).ok();
+            }
         }
         #[cfg(target_arch = "wasm32")]
-        work();
+        {
+            let p = progress.clone();
+            let ctx = self.ctx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = web_engine().await.map(|ocr| {
+                    job.run(&ocr, |done, total| {
+                        let Ok(mut s) = p.lock() else { return false };
+                        s.done = done;
+                        s.total = total;
+                        !s.cancel
+                    })
+                });
+                if let Ok(mut s) = p.lock() {
+                    s.result = Some(result);
+                }
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            });
+        }
         self.ocr_run = Some(OcrRun { doc: id, progress });
         self.poll_ocr();
     }
@@ -222,59 +335,30 @@ impl PdfCraftApp {
             return;
         }
         let progress = Arc::new(Mutex::new(BatchProgress { total: files.len(), ..Default::default() }));
-        let p = progress.clone();
         // The summary is written on the worker thread: draw it in the UI's language.
         let lang = crate::i18n::current();
-        let work = move || {
-            crate::i18n::set_current(lang);
-            let (mut ok, mut words, mut failed) = (0, 0, Vec::new());
-            match pdfcraft_engine::ocr::engine() {
-                Err(e) => failed.push(e),
-                Ok(ocr) => {
-                    for (i, (name, bytes)) in files.into_iter().enumerate() {
-                        if let Ok(mut s) = p.lock() {
-                            s.done = i;
-                        }
-                        let r = pdfcraft_engine::ocr::recognize_file(&name, Arc::new(bytes), None, settings.clone(), &ocr, |_, _| true);
-                        let saved = r.and_then(|r| {
-                            #[cfg(not(target_arch = "wasm32"))]
-                            crate::editing::write_atomically(&dir.join(&name).to_string_lossy(), &r.bytes).map_err(|e| e.to_string())?;
-                            #[cfg(target_arch = "wasm32")]
-                            crate::editing::download(&name, &r.bytes)?;
-                            Ok(r.words())
-                        });
-                        match saved {
-                            Ok(n) => {
-                                ok += 1;
-                                words += n;
-                            }
-                            Err(e) => failed.push(format!("{name}: {}", e)),
-                        }
-                    }
-                }
-            }
-            let done = if ok == 1 {
-                crate::i18n::fmt(tl!("Recognized {w} words in 1 file"), &[("w", &words.to_string())])
-            } else {
-                crate::i18n::fmt(tl!("Recognized {w} words in {n} files"), &[("w", &words.to_string()), ("n", &ok.to_string())])
-            };
-            let mut msg = done;
-            if !failed.is_empty() {
-                msg.push_str(&crate::i18n::fmt(tl!("; failed: {list}"), &[("list", &failed.join("; "))]));
-            }
-            if let Ok(mut s) = p.lock() {
-                s.done = s.total;
-                s.message = Some(msg);
-            }
-        };
         #[cfg(not(target_arch = "wasm32"))]
-        if self.run_inline {
-            work();
-        } else {
-            std::thread::Builder::new().name("pdfcraft-ocr-files".into()).spawn(work).ok();
+        {
+            let p = progress.clone();
+            let work = move || finish_batch(files, settings, p, lang, pdfcraft_engine::ocr::engine(), dir);
+            if self.run_inline {
+                work();
+            } else {
+                std::thread::Builder::new().name("pdfcraft-ocr-files".into()).spawn(work).ok();
+            }
         }
         #[cfg(target_arch = "wasm32")]
-        work();
+        {
+            let p = progress.clone();
+            let ctx = self.ctx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let engine = web_engine().await;
+                finish_batch(files, settings, p, lang, engine);
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            });
+        }
         self.ocr_batch = Some(progress);
         self.poll_ocr();
     }
