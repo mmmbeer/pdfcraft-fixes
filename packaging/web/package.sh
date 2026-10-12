@@ -3,8 +3,9 @@
 #
 # Usage: packaging/web/package.sh [--skip-build]
 #
-# Needs: trunk (brew install trunk / cargo install trunk --locked) and the wasm32-unknown-unknown
-# target. The zip holds a self-contained static site in pdfcraft-web-<version>/ that works
+# Needs: trunk (brew install trunk / cargo install trunk --locked), curl/network for the verified
+# OCR model fetch, and the wasm32-unknown-unknown target. The zip holds a self-contained static
+# site in pdfcraft-web-<version>/ that works
 # from any URL path and inside an <iframe>. Hosting notes: packaging/web/README.md.
 set -euo pipefail
 # shellcheck source=../env.sh
